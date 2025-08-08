@@ -99,7 +99,7 @@ namespace intercept {
         return p->is_valid();
     }
 
-    static const char* getRTTIName(uintptr_t vtable) {
+    static const char* getRTTIName(uintptr_t classInstanceWithVtablePtr) {
         class v1 {
             virtual void doStuff() {}
         };
@@ -107,16 +107,16 @@ namespace intercept {
             virtual void doStuff() {}
         };
 
-        if (IsBadReadPtr(*(void**)vtable, sizeof(uintptr_t)))
+        if (IsBadReadPtr(*(void**)classInstanceWithVtablePtr, sizeof(uintptr_t)))
         {
             return "";
         }
 
 
-        v2* v = (v2*)vtable;
+        v2* v = (v2*)classInstanceWithVtablePtr;
         try {
             // Validate that we have a RTTI enabled type
-            if (!*reinterpret_cast<uintptr_t*>(vtable))  // vtable points to nothing, if it were a vtable there would be a function pointer there
+            if (!*reinterpret_cast<uintptr_t*>(classInstanceWithVtablePtr))  // vtable points to nothing, if it were a vtable there would be a function pointer there
                 return "";
 
             auto& typex = typeid(*v);
@@ -153,7 +153,54 @@ namespace intercept {
         auto future_allocatorVtablePtr = std::async(std::launch::deferred, [&memorySections, fut_stringOffset = std::move(future_stringOffset)]() mutable -> uintptr_t {
             uintptr_t stringOffset = fut_stringOffset.get();
 #ifndef __linux__
-            return (memorySections.findInMemory(reinterpret_cast<char*>(&stringOffset), sizeof(uintptr_t)) - sizeof(uintptr_t));
+
+
+
+            // stringOffset = char[] tbb4malloc
+            // Find next pointer
+            while (
+                ((*(uintptr_t*)stringOffset) & 0xFFF0000000000000) != 0      // Bad address
+                || ((*(uintptr_t*)stringOffset) & ~0xFFF0000000000000) == 0  // Not an address (align)
+            )
+                stringOffset += sizeof(uintptr_t);
+
+            // Should be RTTI locator, followed by vtable
+
+            // #TODO vtable first entry points to .text section
+            // The pointer above vtable, is the RTTI locator in .rdata, wóuld be easy if we had the sections seperately listed.
+
+            // We are looking for read-only followed by RX
+
+
+            auto IsValidVtableWithRTTI = [&memorySections](uintptr_t vtable) {
+                // First pointer is in .text, RX the first vtable function/destructor
+                // Previous pointer is .rdata, R the RTTI Locator
+
+                // Precondition, vtable is valid read ptr
+
+                auto funcPtr = memorySections.GetSectionByAddress(*(uintptr_t*)vtable);
+                auto locatorPtr = memorySections.GetSectionByAddress(*(uintptr_t*)(vtable - sizeof(uintptr_t)));
+
+                if (!funcPtr || !locatorPtr)
+                    return false;
+
+                if (!(funcPtr->access & MemorySection::SectionAccess::X))  // X must be
+                    return false;
+                if ((locatorPtr->access & ~MemorySection::SectionAccess::R))  // WX must not be
+                    return false;
+
+                return true;
+            };
+
+            while (!IsValidVtableWithRTTI(stringOffset))
+            {
+                stringOffset += sizeof(uintptr_t);
+            }
+
+            // We now have _a_ vtable, lets hope that's it.
+
+
+            return stringOffset;
 #elif _LINUX64
                 bool oldCompiler = *reinterpret_cast<uintptr_t*>(stringOffset - 8) == stringOffset;
 
@@ -191,6 +238,11 @@ namespace intercept {
                 { // diag exe
                     result = memorySections.findInMemoryPattern("\x48\x89\x5C\x24\x00\x48\x89\x74\x24\x00\x57\x48\x83\xEC\x20\xFF\x41\x60\x33\xF6\x48\x8B\x41\x08\x48\x8B\xD9\x48\x3B\xC1\x74\x0F\x48\x85\xC0\x74\x0A\x48\x83\xC0\xE0\x0F\x85\x00\x00\x00\x00\x48\x8B\x41\x20\x48\x8D\x79\x18\x48\x3B\xC7\x74\x0F\x48\x85\xC0\x74\x0A\x48\x83\xC0\xE0\x0F\x85\x00\x00\x00\x00\x48\x63\x51\x58\x48\x8B\x0D\x00\x00\x00\x00\x4C\x8B\xC2\x48\x8B\x01\xFF\x50\x38\x8B\x4B\x00\x48\x8B\xD0\x01\x0D\x00\x00\x00\x00\x48\x89\x70\x28\x48\x89\x70\x20\x4C\x8D\x40\x20\x48\x85\xC0\x0F\x84\x00\x00\x00\x00\x89\x30\x89\x70\x10\x48\x89\x58\x08\x48\x8B\x4F\x08\x4C\x89\x01\x48\x8B\x47\x08\x49\x89\x38\x48\x89\x42\x28\xFF\x47\x10\x4C\x89\x47\x08\x44\x8B\x43\x5C\x44\x8B\x4B\x54\x41\xFF\xC8", "xxxx?xxxx?xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx????xxxxxxxxxxxxxxxxxxxxxxxx????xxxxxxx????xxxxxxxxxxx?xxxxx????xxxxxxxxxxxxxxxxx????xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
                 }
+            }
+
+            if (!result)
+            {
+                result = memorySections.findInMemoryPattern("\x48\x89\x5C\x24\x00\x48\x89\x74\x24\x00\x57\x48\x83\xEC\x20\xFF\x41\x00\x33\xF6\x48\x8B\x41\x00\x48\x8B\xD9\x48\x3B\xC1\x74\x00\x48\x85\xC0\x74\x00\x48\x83\xC0\xE0\x0F\x85\x00\x00\x00\x00\x48\x8B\x41\x00\x48\x8D\x79\x00\x48\x3B\xC7\x74\x00\x48\x85\xC0\x74\x00\x48\x83\xC0\xE0\x0F\x85\x00\x00\x00\x00\x48\x63\x51\x00\x48\x8B\x0D\x00\x00\x00\x00\x4C\x8B\xC2\x48\x8B\x01\xFF\x50\x00\x4C\x8B\xC0\x48\x85\xC0\x0F\x84\x00\x00\x00\x00\x48\x89\x70\x00\x48\x8D\x50\x00\x48\x89\x70\x00\x48\x85\xC0\x89\x30\x48\x0F\x44\xD6\x89\x70\x00\x48\x89\x58\x00\x48\x8B\x47\x00\x48\x89\x10\x48\x8B\x47\x00\x49\x89\x40\x00\x49\x89\x78\x00\xFF\x47\x00\x48\x89\x57\x00\x44\x8B\x4B\x00\x8B\x53\x00\x41\xFF\xC9\x4C\x63\x53\x00\x44\x0F\xAF\xCA\x49\x83\xC2\x30\x4D\x03\xD0\x49\x8B\xCA\x4D\x03\xCA\x4D\x3B\xD1\x73\x00\x66\x66\x66\x0F\x1F\x84\x00\x00\x00\x00\x00\x8B\xC2\x48\x03\xC1", "xxxx?xxxx?xxxxxxx?xxxxx?xxxxxxx?xxxx?xxxxxx????xxx?xxx?xxxx?xxxx?xxxxxx????xxx?xxx????xxxxxxxx?xxxxxxxx????xxx?xxx?xxx?xxxxxxxxxxx?xxx?xxx?xxxxxx?xxx?xxx?xx?xxx?xxx?xx?xxxxxx?xxxxxxxxxxxxxxxxxxxxx?xxxxxxx????xxxxx");
             }
 
             return result;
@@ -330,47 +382,21 @@ namespace intercept {
         const char* test = getRTTIName((uintptr_t)(&allocatorVtablePtr));
         assert(strcmp(test, "12MemFunctions") == 0);
 #else
-        const char* test = getRTTIName(allocatorVtablePtr);
-        bool vc143Allocator = false;
+        const char* test = getRTTIName((uintptr_t)(&allocatorVtablePtr));
+        constexpr bool vc143Allocator = true;
         if (strlen(test) == 0 || strcmp(test, ".?AVMemTableFunctions@@") != 0) {
-            allocatorVtablePtr -= 0x4B8;  // vc143 build
-            test = getRTTIName(allocatorVtablePtr);
+            LOG(ERROR, "Loader failed on main allocator");
+            return false;
+        }
 
-            if (strlen(test) == 0 || strcmp(test, ".?AVMemTableFunctions@@") != 0) {
-                // Okey... Lets go nuts.
-                allocatorVtablePtr -= 0x200;
+        // Okey we have pointer to vtable, but we want pointer to class instance, find it
 
-                auto canBeVtable = [&memorySections](uintptr_t value) {
+        allocatorVtablePtr = memorySections.findInMemory(reinterpret_cast<char*>(&allocatorVtablePtr), sizeof(uintptr_t));
 
-                    if (!memorySections.IsInAnySection(value))
-                        return false;
-
-                    for (size_t i = 0; i < 8; ++i) {
-                        // check if plausible that its a vtable
-                        uintptr_t funcAddress = *reinterpret_cast<uintptr_t*>(value + i*8);
-
-                        if (!memorySections.IsInAnySection(funcAddress))
-                            return false;
-                    }
-                    return true;
-                };
-
-                for (size_t i = allocatorVtablePtr; i < allocatorVtablePtr + 0x800; i+=8) {
-                    uintptr_t value = *reinterpret_cast<uintptr_t *>(i);
-
-                    if (!canBeVtable(value))
-                        continue;
-
-                    test = getRTTIName(i);
-                    if (strcmp(test, ".?AVMemTableFunctions@@") == 0)
-                    {
-                        allocatorVtablePtr = i;
-                        break;
-                    }
-                }
-            }
-
-            vc143Allocator = true;
+        test = getRTTIName(allocatorVtablePtr);
+        if (strlen(test) == 0 || strcmp(test, ".?AVMemTableFunctions@@") != 0) {
+            LOG(ERROR, "Loader failed on main allocator");
+            return false;
         }
 
         assert(strcmp(test, ".?AVMemTableFunctions@@") == 0);

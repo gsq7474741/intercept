@@ -1,7 +1,7 @@
 #pragma once
 
 
-    class MemorySection {
+class MemorySection {
 public:
 #if _WIN32 || _WIN64
     explicit MemorySection(const MODULEINFO& modInfo) noexcept : start(reinterpret_cast<uintptr_t>(modInfo.lpBaseOfDll)),
@@ -10,6 +10,16 @@ public:
     MemorySection(uintptr_t _start, uintptr_t _end) noexcept : start(_start), end(_end) {}
     uintptr_t start;
     uintptr_t end;
+
+    enum SectionAccess
+    {
+        R = 1,
+        W = 2,
+        X = 4
+    };
+
+    SectionAccess access {SectionAccess(0)};
+
     inline size_t size() const {
         return end - start;
     }
@@ -56,14 +66,7 @@ protected:
 
 public:
 #if _WIN32 || _WIN64
-    MemorySections() {
-        MODULEINFO modInfo = {nullptr};
-        HMODULE hModule = GetModuleHandleA(nullptr);
-        GetModuleInformation(GetCurrentProcess(), hModule, &modInfo, sizeof(MODULEINFO));
-        const uintptr_t baseAddress = reinterpret_cast<uintptr_t>(modInfo.lpBaseOfDll);
-        const uintptr_t moduleSize = static_cast<uintptr_t>(modInfo.SizeOfImage);
-        sections.push_back(MemorySection(modInfo));
-    }
+    MemorySections();
 #endif  // _WIN32 || _WIN64
 #ifdef __linux__
     MemorySections(const char* path = "/proc/self/maps") {
@@ -127,10 +130,14 @@ public:
     }
 
     bool IsInAnySection(uintptr_t address) const {
+        return GetSectionByAddress(address).has_value();
+    }
+
+    std::optional<MemorySection> GetSectionByAddress(uintptr_t address) const {
         for (const auto& section : sections) {
             if (section.start < address && address < section.end)
-                return true;
+                return section;
         }
-        return false;
+        return std::nullopt;
     }
 };
